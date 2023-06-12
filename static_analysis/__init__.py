@@ -423,6 +423,7 @@ class AnnotatedAliasDetector(ast.NodeVisitor):
             self.visit_module(module, level=0)
         if hasattr(node, "module") and hasattr(node, "level"):
             self.visit_module(node.module, node.level)
+        self.generic_visit(node)
 
     def visit_ImportFrom(self, node):
         if not node.module:
@@ -456,42 +457,100 @@ class AnnotatedAliasDetector(ast.NodeVisitor):
                 if sym_name in self.annotated_aliases:
                     self.annotated_aliases.add(alias_name)
 
-            self.visit(name)
+            self.generic_visit(name)
         self.generic_visit(node)
 
-    def visit_Assign(self, node):
-        # TODO: handle multiple targets, values
-        if not isinstance(node.targets[0], ast.Name):
-            return
+    
+    def get_name(self, node):
+        if isinstance(node, ast.Name):
+            return node.id
+        elif isinstance(node, ast.Attribute):
+            return f'{self.get_name(node.value)}.{node.attr}'
+        elif isinstance(node, ast.Subscript):
+            name = self.get_name(node.value)
+            if node.slice:
+                name = f"{name}[{self.get_name(node.slice)}]"
+            return name
+        elif isinstance(node, ast.Slice):
+            # TODO: handle this properly
+            return '<slice>'
+        else:
+            return '<unknown>'
 
-        target_name = node.targets[0].id
+
+    def unpack_assignment(self, target, value):
+        if isinstance(target, ast.Tuple) and isinstance(value, (ast.Tuple, ast.List)):
+            for sub_target, sub_value in zip(target.elts, value.elts):
+                self.unpack_assignment(sub_target, sub_value)
+        else:
+            self.process_assignment(target, value)
+
+    def process_assignment(self, target, value):
+        target_name = self.get_name(target)
+        value_name = self.get_name(value)
+
         if self.current_module:
             target_name = f"{self.current_module}.{target_name}"
-        if isinstance(node.value, ast.Name):
-            value_name = node.value.id
-            if self.current_module:
-                value_name = f"{self.current_module}.{value_name}"
-            if value_name in self.annotated_aliases:
-                self.annotated_aliases.add(target_name)
+            value_name = f"{self.current_module}.{value_name}"
+
+        if value_name in self.annotated_aliases:
+            self.annotated_aliases.add(target_name)
+        else:
+            self.annotated_aliases.discard(target_name)
+        
+
+    """
+    class Foo:
+        pass
+    
+    FooType = jaxtyping.Float
+    Foo.Float = jaxtyping.Float # value is assignment
+    Foo.Float, BarType = 
+    """
+
+    def visit_Assign(self, node):
+        if len(node.targets) > 1:
+            if not isinstance(node.value, (ast.Tuple, ast.List)) or len(node.value.elts) != len(node.targets):
+                # x = y = z case
+                for target in node.targets:
+                    self.process_assignment(target, node.value)
             else:
-                # was assigned to something else
-                self.annotated_aliases.discard(target_name)
-        elif isinstance(node.value, ast.Subscript) and isinstance(node.value.value, ast.Name):
-            # Check if being assigned to Annotated
-            value_name = node.value.value.id
-            if self.current_module:
-                value_name = f"{self.current_module}.{value_name}"
-            if value_name in self.annotated_aliases:
-                self.annotated_aliases.add(target_name)
-            else:
-                # was assigned to something else
-                self.annotated_aliases.discard(target_name)
-        elif isinstance(node.value, ast.Attribute):
-            value_name = f"{node.value.value.id}{node.value.attr}"
-            if self.current_module:
-                value_name = f"{self.current_module}.{value_name}"
-            if value_name in self.annotated_aliases:
-                self.annotated_aliases.add(target_name)
-            else:
-                # was assigned to something else
-                self.annotated_aliases.discard(target_name)
+                for target, value in zip(node.targets, node.value.elts):
+                    self.unpack_assignment(target, value)
+        else:
+            self.unpack_assignment(node.targets[0], node.value)
+        self.generic_visit(node)
+
+
+        ## A = Blah.FooType
+        #target_name = node.targets[0].id
+        #if self.current_module:
+        #    target_name = f"{self.current_module}.{target_name}"
+        #if isinstance(node.value, ast.Name):
+        #    value_name = node.value.id
+        #    if self.current_module:
+        #        value_name = f"{self.current_module}.{value_name}"
+        #    if value_name in self.annotated_aliases:
+        #        self.annotated_aliases.add(target_name)
+        #    else:
+        #        # was assigned to something else
+        #        self.annotated_aliases.discard(target_name)
+        #elif isinstance(node.value, ast.Subscript) and isinstance(node.value.value, ast.Name):
+        #    # Check if being assigned to Annotated
+        #    value_name = node.value.value.id
+        #    if self.current_module:
+        #        value_name = f"{self.current_module}.{value_name}"
+        #    if value_name in self.annotated_aliases:
+        #        self.annotated_aliases.add(target_name)
+        #    else:
+        #        # was assigned to something else
+        #        self.annotated_aliases.discard(target_name)
+        #elif isinstance(node.value, ast.Attribute):
+        #    value_name = f"{node.value.value.id}{node.value.attr}"
+        #    if self.current_module:
+        #        value_name = f"{self.current_module}.{value_name}"
+        #    if value_name in self.annotated_aliases:
+        #        self.annotated_aliases.add(target_name)
+        #    else:
+        #        # was assigned to something else
+        #        self.annotated_aliases.discard(target_name)
