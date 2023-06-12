@@ -213,31 +213,8 @@ builtin_modules = [
     'zlib'
 ]
 
-def get_module_from_path(path: Path, level: int):
-    """Extracts module name from path up to level
-    
-    Examples:
-
-    Suppose path is "module_a/foo/__init__.py"
-    if level is 1, then returns "foo"
-    if level is 2, then returns "module_a.foo"
-    """
-    assert level >= 1, "level must be >= 1"
-
-    if path.name == '__init__.py':
-        path = path.parent
-
-    parts = []
-    for _ in range(level):
-        part = path.name
-        if part.endswith(".py"):
-            part = part.replace(".py", "")
-        parts.append(part)
-        path = path.parent
-
-    return ".".join(reversed(parts))
-
 def get_abs_module(current_module: str, module: str, level: int) -> str:
+    """Returns the absolute module relative to the current module given a relative import."""
     assert level >= 1, "level must be >= 1"
 
     parts = current_module.split(".")
@@ -246,54 +223,16 @@ def get_abs_module(current_module: str, module: str, level: int) -> str:
     parts.append(module)
     return ".".join(parts)
 
-
-def get_path_for_relative_import(cwd: Path, module_name: str, level: int) -> Path:
-    """Returns the path for a relative import given the current directory
-
-    Suppose we are processing the line
-
-    `from .types import FooType` in module_a/__init__.py
-
-    Then we would have
-    cwd = "module_a"
-    module_name = "types"
-    level = 1
-
-    and return "module_a/types.py"
-    """
-    assert level >= 1, "level must be >= 1"
-
-    base_path = cwd
-    for l in range(level-1):
-        base_path = cwd.parent
-
-    parts = module_name.split(".")
-    dirs, module_name = parts[:-1], parts[-1]
-
-    for d in dirs:
-        base_path = base_path / d
-
-    package_path = base_path / module_name / "__init__.py"
-    module_path = base_path / f"{module_name}.py"
-
-    if package_path.exists():
-        return package_path
-    elif module_path.exists():
-        return module_path
-    else:
-        raise FileNotFoundError(f"Could not find module {module_name} at level {level} from {cwd}")
-
 class AnnotatedAliasDetector(ast.NodeVisitor):
-    """Recursively detects all annotated aliases in full module import graph
-    
-    The detector builds a directed graph where symbol names are nodes and edges are imports.
+    """AnnotatedAliasDetector detects Annotated aliases through static analysis and recursively analyzing files by import.
 
     Example:
 
     Suppose we had files like
 
     module_a/types.py:
-        FooType = ...
+        from typing import Annotated
+        FooType = Annotated
 
     module_a/__init__.py:
         from .types import FooType
@@ -301,118 +240,63 @@ class AnnotatedAliasDetector(ast.NodeVisitor):
     main.py:
         from module_a import FooType
 
-    The graph would contain path FooType -> module_a.FooType -> module_a.types.FooType 
+    The visitor visits the files recursively by import and the resulting detected symbols would be
+    {
+        "FooType",
+        "module_a.FooType",
+        "module_a.types.FooType",
+        "module_a.types.Annotated"
+    }
     """
 
     def __init__(self):
-        self.current_dir = Path(os.getcwd())
         self.current_module = None
         self.visited_modules = set()
         self.annotated_aliases = set()
-        self.symbol_def_graph = {}
-
-    def get_root_name(self, name: str) -> str:
-        """Returns the source name of name by walking up the symbol definition graph"""
-        while name:
-            prev_name = name
-            name = self.symbol_def_graph.get(name)
-        return prev_name
-
+    
     def visit_module(self, module: str, level: int) -> str:
         """Recursively visits the module to detect Annotated aliases.
 
-        The module is treated as a relative import if level >= 1
-
         Returns the module's full name which may not be known beforehand because of relative imports
         """
-        base_module = module.split(".")[0]
         if level >= 1:
-            # relative import
+            # convert relative import into absolute import
+            module = get_abs_module(self.current_module, module, level)
 
-            # convert rel import into absolute
-            abs_module = get_abs_module(self.current_module, module, level)
+        base_module = module.split(".")[0]
 
-            if abs_module in self.visited_modules:
-                # already visited
-                return abs_module
-
-            self.visited_modules.add(abs_module)
-
-            # use importlib to find the module path
-            try:
-                module_spec = importlib.util.find_spec(abs_module)
-            except ModuleNotFoundError:
-                # trying to import a module from nonexistant package like "nonexistant_package.module"
-                return abs_module
-
-            if not module_spec:
-                # could not find module
-                return abs_module
-
-            module_path = Path(module_spec.origin)
-            if not str(module_path).endswith(".py"):
-                # could be a shared object or something
-                return abs_module
-            code = module_path.read_text()
-
-            ## do some filesys checking to find the module path
-            #try:
-                #module_path = get_path_for_relative_import(
-                    #cwd=self.current_dir,
-                    #module_name=module,
-                    #level=level)
-            #except FileNotFoundError:
-                ## TODO: This is happening for numpy _multiarray_umath. not sure why yet
-                #return module
-
-            #code = module_path.read_text()
-            module_node = compile(code, filename="<string>", mode="exec", flags=ast.PyCF_ONLY_AST)
-            old_current_dir = self.current_dir
-            old_current_module = self.current_module
-            self.current_module = abs_module
-            self.current_dir = module_path.parent
-            self.visit(module_node)
-            self.current_dir = old_current_dir
-            self.current_module = old_current_module
-            return abs_module
-        else:
-            # absolute import
-
-            # in builtins
-            if base_module in builtin_modules:
-                return module
-
-            # already visited
-            if module in self.visited_modules:
-                return module
-
-            # use importlib to find the module path
-            try:
-                module_spec = importlib.util.find_spec(module)
-            except ModuleNotFoundError:
-                # trying to import a module from nonexistant package like "nonexistant_package.module"
-                return module
-
-            if not module_spec:
-                # could not find module
-                return module
-
-            module_path = Path(module_spec.origin)
-            if not str(module_path).endswith(".py"):
-                # could be a shared object or something
-                return module
-            code = module_path.read_text()
-
-            module_node = compile(code, filename="<string>", mode="exec", flags=ast.PyCF_ONLY_AST)
-            old_current_module = self.current_module
-            old_current_dir = self.current_dir
-            self.current_dir = module_path.parent
-            self.current_module = module
-            self.visited_modules.add(module)
-            self.visit(module_node)
-            self.current_dir = old_current_dir
-            self.current_module = old_current_module
+        # in builtins
+        if base_module in builtin_modules:
             return module
+
+        # already visited
+        if module in self.visited_modules:
+            return module
+
+        # use importlib to find the module path
+        try:
+            module_spec = importlib.util.find_spec(module)
+        except ModuleNotFoundError:
+            # trying to import a module from nonexistant package like "nonexistant_package.module"
+            return module
+
+        if not module_spec:
+            # could not find module
+            return module
+
+        module_path = Path(module_spec.origin)
+        if not str(module_path).endswith(".py"):
+            # could be a shared object or something?
+            return module
+        code = module_path.read_text()
+
+        module_node = compile(code, filename="<string>", mode="exec", flags=ast.PyCF_ONLY_AST)
+        old_current_module = self.current_module
+        self.current_module = module
+        self.visited_modules.add(module)
+        self.visit(module_node)
+        self.current_module = old_current_module
+        return module
 
     def visit_Import(self, node):
         for name in node.names:
@@ -461,7 +345,8 @@ class AnnotatedAliasDetector(ast.NodeVisitor):
         self.generic_visit(node)
 
     
-    def get_name(self, node):
+    def get_name(self, node) -> str:
+        """Converts node to symbol name"""
         if isinstance(node, ast.Name):
             return node.id
         elif isinstance(node, ast.Attribute):
@@ -472,7 +357,7 @@ class AnnotatedAliasDetector(ast.NodeVisitor):
                 name = f"{name}[{self.get_name(node.slice)}]"
             return name
         elif isinstance(node, ast.Slice):
-            # TODO: handle this properly
+            # TODO: handle this properly?
             return '<slice>'
         else:
             return '<unknown>'
@@ -497,60 +382,17 @@ class AnnotatedAliasDetector(ast.NodeVisitor):
             self.annotated_aliases.add(target_name)
         else:
             self.annotated_aliases.discard(target_name)
-        
-
-    """
-    class Foo:
-        pass
-    
-    FooType = jaxtyping.Float
-    Foo.Float = jaxtyping.Float # value is assignment
-    Foo.Float, BarType = 
-    """
 
     def visit_Assign(self, node):
         if len(node.targets) > 1:
             if not isinstance(node.value, (ast.Tuple, ast.List)) or len(node.value.elts) != len(node.targets):
-                # x = y = z case
+                # assign each target to node value
                 for target in node.targets:
-                    self.process_assignment(target, node.value)
+                    self.unpack_assignment(target, node.value)
             else:
+                # destructured assignment case
                 for target, value in zip(node.targets, node.value.elts):
                     self.unpack_assignment(target, value)
         else:
             self.unpack_assignment(node.targets[0], node.value)
         self.generic_visit(node)
-
-
-        ## A = Blah.FooType
-        #target_name = node.targets[0].id
-        #if self.current_module:
-        #    target_name = f"{self.current_module}.{target_name}"
-        #if isinstance(node.value, ast.Name):
-        #    value_name = node.value.id
-        #    if self.current_module:
-        #        value_name = f"{self.current_module}.{value_name}"
-        #    if value_name in self.annotated_aliases:
-        #        self.annotated_aliases.add(target_name)
-        #    else:
-        #        # was assigned to something else
-        #        self.annotated_aliases.discard(target_name)
-        #elif isinstance(node.value, ast.Subscript) and isinstance(node.value.value, ast.Name):
-        #    # Check if being assigned to Annotated
-        #    value_name = node.value.value.id
-        #    if self.current_module:
-        #        value_name = f"{self.current_module}.{value_name}"
-        #    if value_name in self.annotated_aliases:
-        #        self.annotated_aliases.add(target_name)
-        #    else:
-        #        # was assigned to something else
-        #        self.annotated_aliases.discard(target_name)
-        #elif isinstance(node.value, ast.Attribute):
-        #    value_name = f"{node.value.value.id}{node.value.attr}"
-        #    if self.current_module:
-        #        value_name = f"{self.current_module}.{value_name}"
-        #    if value_name in self.annotated_aliases:
-        #        self.annotated_aliases.add(target_name)
-        #    else:
-        #        # was assigned to something else
-        #        self.annotated_aliases.discard(target_name)
