@@ -1,5 +1,5 @@
 from typing import Annotated
 
-FooType = Annotated[str, "This is a FooType"]
+FooType = Annotated
 BarType = FooType
 BazType = BarType
